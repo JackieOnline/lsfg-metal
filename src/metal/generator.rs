@@ -892,7 +892,9 @@ impl Worker {
             (w, h),
             p.flow_scale,
             p.performance_mode,
-            format == vk::Format::R16G16B16A16_SFLOAT,
+            // 10-bit PQ layers must take the 16F pipeline as well: the 8-bit
+            // srgb path blits 1023 PQ codes down to 255 and washes dark scenes
+            format == vk::Format::R16G16B16A16_SFLOAT || format == vk::Format::A2B10G10R10_UNORM_PACK32,
         )?);
         self.pacer = adaptive.then(|| Pacer::new(self.refresh, m));
         if self.sems.is_none() {
