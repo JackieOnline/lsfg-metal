@@ -100,10 +100,13 @@ impl Generator {
         // sinks it to ~20 fps, below the gate rate. Depth 2 keeps one frame of
         // overlap while still barring the 2-3 deep queue that makes an unpaced
         // producer run ahead of the display.
-        // generation: LSFGM_POOL (1..=3, default 3 as shipped). Experiment in
-        // flight: depth 2 with an unlimited in-game cap - one frame of overlap
-        // for the interpolation pipeline, while the queue that makes unpaced
-        // generation feel mushy shrinks by a frame.
+        // generation: LSFGM_POOL (1..=3, default 3 as shipped). The depth-2
+        // experiment with an unlimited in-game cap was REFUTED in the field:
+        // generation retires proxies through present events a full output
+        // pair after arrival, so depth 2 still leaves the engine 1.5-2 frames
+        // ahead and the input lag stays severe; depth 1 starves the pipeline
+        // outright (the pacer's depth-1 lesson, but worse). The shipped depth
+        // stands - for low latency cap the game to the slot rate instead.
         let pool_cap = if super::setup().is_some_and(|s| s.profile.pacer_fps > 0) {
             std::env::var("LSFGM_PACER_POOL")
                 .ok()
