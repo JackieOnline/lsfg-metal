@@ -1,4 +1,6 @@
 // generator library: instance (own / adopt) and context with the timeline protocol
+pub mod convert;
+pub mod deadband;
 pub mod pipeline;
 pub mod signature;
 
@@ -201,6 +203,7 @@ pub struct Context {
     internal_value: u64,
     fence_pending: bool,
     pub pipeline: Pipeline,
+    convert: Option<convert::Convert>,
 }
 
 impl Context {
@@ -211,8 +214,21 @@ impl Context {
         flow: f32,
         perf: bool,
         hdr: bool,
+        pq: bool,
     ) -> Result<Context, String> {
         let pipeline = Pipeline::new(inst.clone(), w, h, flow, perf, hdr)?;
+        // PQ day route: convert codes to sRGB at the boundaries so the
+        // generator runs the 8-bit pipeline it was tuned on for SDR games
+        let convert = if pq {
+            Some(convert::Convert::new(
+                inst.clone(),
+                pipeline.source,
+                pipeline.destination,
+                (w, h),
+            )?)
+        } else {
+            None
+        };
         let d = &inst.device;
         let (sync, internal, fence) = (
             vkutil::create_semaphore(d, true)?,
@@ -232,12 +248,18 @@ impl Context {
             internal_value: 0,
             fence_pending: false,
             pipeline,
+            convert,
         })
     }
 
     // (source image with 2 layers, destination image, sync semaphore)
     pub fn handles(&self) -> (vk::Image, vk::Image, vk::Semaphore) {
         (self.pipeline.source, self.pipeline.destination, self.sync)
+    }
+
+    // PQ boundary conversion when the layer carries 10-bit HDR10 codes
+    pub fn convert(&self) -> Option<&convert::Convert> {
+        self.convert.as_ref()
     }
 
     fn submit(

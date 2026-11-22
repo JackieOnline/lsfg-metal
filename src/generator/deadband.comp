@@ -1,0 +1,35 @@
+#version 450
+
+// temporal deadband: kill frame-to-frame noise before the flow sees it.
+//
+// the game's hdr pipeline dithers every frame (anti-banding noise, a
+// couple of pq code steps); the flow matcher reads that noise as motion
+// and warps static content - straight lines bend in generated frames.
+// this pass compares the freshly imported codes against the other source
+// layer (the previous frame): differences below the threshold are noise,
+// so write the previous value and the two frames become exactly equal -
+// the flow estimates zero motion on static content and generated frames
+// become geometrically exact copies. real motion changes pixels by
+// orders of magnitude more than the threshold and passes untouched.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform image2D cur;
+layout(set = 0, binding = 1, rgba16f) uniform image2D prev;
+
+// the threshold in pq code units. the dose-response measured the bands:
+// 4 lsb reduced the static warp without side effects but did not kill
+// it (noise > 4 lsb, taa temporal edge reconstruction); 32 lsb ate real
+// content (sky animation and grain sit below 32 lsb and froze into
+// patches - whole-frame flicker). the noise and content bands overlap,
+// so a single global threshold cannot separate them; the next step, if
+// any, is an edge-weighted threshold (large on line structures where
+// the noise lives, small on smooth gradients where animation lives).
+const float T = 4.0 / 1023.0;
+
+void main() {
+    ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    if (uv.x >= imageSize(cur).x || uv.y >= imageSize(cur).y) return;
+    vec4 c = imageLoad(cur, uv);
+    vec4 p = imageLoad(prev, uv);
+    imageStore(cur, uv, mix(c, p, lessThan(abs(c - p), vec4(T))));
+}

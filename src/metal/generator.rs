@@ -73,6 +73,11 @@ pub struct Generator {
     started: Once,
     pool: Mutex<Pool>,
     pool_cv: Condvar,
+    // pacer mode runs the pool shallower than generation (LSFGM_PACER_POOL,
+    // default 2): depth bars the engine from queueing frames ahead of the
+    // slot gate, but one frame of overlap must survive, or the serialized
+    // frame cost sinks below the gate rate (depth 1 measured ~20 fps in-world)
+    pool_cap: u32,
 }
 unsafe impl Send for Generator {}
 unsafe impl Sync for Generator {}
@@ -89,6 +94,21 @@ impl Generator {
         }
         let device = layer.device().or_else(|| MTLCreateSystemDefaultDevice())?;
         let (tx, rx) = channel();
+        // pacer: pool depth 2 by default (LSFGM_PACER_POOL, 1..=3). Depth 1 proved
+        // too shallow in the field: with acquire gated on the previous present
+        // the engine loses its CPU/GPU overlap and the serialized frame cost
+        // sinks it to ~20 fps, below the gate rate. Depth 2 keeps one frame of
+        // overlap while still barring the 2-3 deep queue that makes an unpaced
+        // producer run ahead of the display.
+        let pool_cap = if super::setup().is_some_and(|s| s.profile.pacer_fps > 0) {
+            std::env::var("LSFGM_PACER_POOL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| (1..=3).contains(n))
+                .unwrap_or(2)
+        } else {
+            3
+        };
         let g = Box::leak(Box::new(Generator {
             latency: latency::Probe::default(),
             layer: layer.retain(),
@@ -109,6 +129,7 @@ impl Generator {
                 next_id: 1,
             }),
             pool_cv: Condvar::new(),
+            pool_cap,
         }));
         map.insert(layer as *const _ as usize, g);
         Some(g)
@@ -170,11 +191,11 @@ impl Generator {
             self.layer.pixelFormat(),
         );
         let mut pool = self.pool.lock().unwrap();
-        while pool.outstanding >= 3 {
+        while pool.outstanding >= self.pool_cap {
             // like the real layer's one-second nextDrawable timeout: the caller gets a real drawable
             let (p, r) = self.pool_cv.wait_timeout(pool, Duration::from_secs(1)).unwrap();
             pool = p;
-            if r.timed_out() && pool.outstanding >= 3 {
+            if r.timed_out() && pool.outstanding >= self.pool_cap {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::warn("Metal drawable pool exhausted (the game holds three drawables); this frame and any like it present natively");
@@ -521,8 +542,9 @@ impl Wrapper {
         flow: f32,
         perf: bool,
         hdr: bool,
+        pq: bool,
     ) -> Result<Wrapper, String> {
-        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr)?;
+        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr, pq)?;
         let (source, dest, sync) = ctx.handles();
         Ok(Wrapper {
             ctx,
@@ -770,6 +792,10 @@ struct Worker {
     cmd: Vec<vk::CommandBuffer>,
     present_serial: u64,
     refresh: f64,
+    // pacer: 0.0 = generation as configured, otherwise paced native presents
+    pacer_slot: f64,
+    next_deadline: f64,
+    pacer_logged: bool,
     stats: Stats,
     stats_on: bool,
     dump_dir: Option<PathBuf>,
@@ -777,9 +803,20 @@ struct Worker {
 
 impl Worker {
     fn new(gen: &'static Generator) -> Worker {
+        let setup = setup().expect("worker without a profile");
+        let refresh = display_refresh();
+        // pacer: the fps target maps to whole display slots; 60 fps -> 1 slot, 30 -> 2
+        let pacer_slot = if setup.profile.pacer_fps > 0 {
+            let n = ((1.0 / setup.profile.pacer_fps as f64) / refresh)
+                .round()
+                .max(1.0);
+            n * refresh
+        } else {
+            0.0
+        };
         Worker {
             gen,
-            setup: setup().expect("worker without a profile"),
+            setup,
             backend: None,
             ctx: None,
             pacer: None,
@@ -790,7 +827,10 @@ impl Worker {
             frame_pending: false,
             cmd: Vec::new(),
             present_serial: 0,
-            refresh: display_refresh(),
+            refresh,
+            pacer_slot,
+            next_deadline: 0.0,
+            pacer_logged: false,
             stats: Stats::default(),
             stats_on: std::env::var_os("LSFGM_STATS").is_some(),
             dump_dir: std::env::var_os("LSFGM_METAL_DUMP")
@@ -827,8 +867,21 @@ impl Worker {
             self.stats.seconds += job.sample.interval;
             self.stats.samples += 1;
         }
+        // recon: velocity sampling rides the worker's own dump machinery,
+        // the context the source-frame dumps have always used safely
+        if crate::metal::recon::recon_on() {
+            crate::metal::recon::velocity_tick(&self.gen.device, &self.gen.present_queue);
+        }
+        // memscan: read-only engine-memory reconnaissance (LSFGM_MEMSCAN),
+        // kernel-mediated reads, budgeted per present - observation only
+        if crate::metal::memscan::on() {
+            crate::metal::memscan::tick();
+        }
         if !enabled() {
             return self.present_natively(job);
+        }
+        if self.pacer_slot > 0.0 {
+            return self.paced_present(job);
         }
         match self.generate(job) {
             Ok(()) => {}
@@ -895,6 +948,9 @@ impl Worker {
             // 10-bit PQ layers must take the 16F pipeline as well: the 8-bit
             // srgb path blits 1023 PQ codes down to 255 and washes dark scenes
             format == vk::Format::R16G16B16A16_SFLOAT || format == vk::Format::A2B10G10R10_UNORM_PACK32,
+            // the metal route handles 10-bit PQ through the 16F pipeline itself;
+            // the front-end PQ day-convert belongs to the dormant GL path
+            false,
         )?);
         self.pacer = adaptive.then(|| Pacer::new(self.refresh, m));
         if self.sems.is_none() {
@@ -1157,6 +1213,40 @@ impl Worker {
         Ok(())
     }
 
+    // pacer: no generation; hold the present until its slot, then show it.
+    // blocking the worker back-pressures the game onto the slot cadence -
+    // a single clock source, unlike an async scheduler holding a queue.
+    fn paced_present(&mut self, job: &Job) {
+        if !self.pacer_logged {
+            self.pacer_logged = true;
+            log::info(&format!(
+                "Metal pacer active: {} fps target ({} slots of a {} Hz display), proxy pool depth {}",
+                self.setup.profile.pacer_fps,
+                (self.pacer_slot / self.refresh).round() as u32,
+                (1.0 / self.refresh).round() as u32,
+                self.gen.pool_cap
+            ));
+        }
+        let slot = self.pacer_slot;
+        let now = super::now();
+        // a long stall (loading screen, hitch): re-anchor, never burst
+        if self.next_deadline < now - slot {
+            self.next_deadline = now;
+        }
+        if self.next_deadline - now > 0.0005 {
+            // sleep coarse, spin the last millisecond: wake precision over timer jitter
+            let coarse = self.next_deadline - now - 0.001;
+            if coarse > 0.0 {
+                std::thread::sleep(Duration::from_secs_f64(coarse));
+            }
+            while super::now() < self.next_deadline {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+        self.next_deadline += slot;
+        self.present_natively(job);
+    }
+
     fn present_natively(&mut self, job: &Job) {
         if present_natively(self.gen, job) {
             self.stats.original += 1;
@@ -1172,7 +1262,12 @@ impl Worker {
         }
         let s = &mut self.stats;
         let mut line = format!(
-            "Frame generation stats pid={} source={} original={} generated={} total={}",
+            "{} pid={} source={} original={} generated={} total={}",
+            if self.pacer_slot > 0.0 {
+                "Metal pacer stats"
+            } else {
+                "Frame generation stats"
+            },
             std::process::id(),
             s.source,
             s.original,

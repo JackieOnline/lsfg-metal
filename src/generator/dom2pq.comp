@@ -1,0 +1,28 @@
+#version 450
+
+// export conversion: generator domain -> per-channel PQ (ST 2084) code.
+// exact inverse of pq2dom.comp: undo the power law, then the PQ OETF.
+//
+// Y = D^G
+// OETF: P = ((c1 + c2 * Y^m1) / (1 + c3 * Y^m1))^m2
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform image2D img;
+
+const float m1 = 0.1593017578125; // 1305 / 8192
+const float m2 = 78.84375;         // 2523 / 4096 * 128
+const float c1 = 0.8359375;       // 3424 / 4096
+const float c2 = 18.8515625;      // 2413 / 4096 * 32
+const float c3 = 18.6875;         // 2392 / 4096 * 32
+
+// the only knob: must match pq2dom.comp
+const float G = 2.6;
+
+void main() {
+    ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    if (uv.x >= imageSize(img).x || uv.y >= imageSize(img).y) return;
+    vec4 lin = pow(clamp(imageLoad(img, uv), vec4(0.0), vec4(1.0)), vec4(G));
+    vec4 r = pow(lin, vec4(m1));
+    vec4 p = (vec4(c1) + c2 * r) / (vec4(1.0) + c3 * r);
+    imageStore(img, uv, min(pow(p, vec4(m2)), vec4(1.0)));
+}

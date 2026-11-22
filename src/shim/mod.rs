@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 
 use ash::{ext, khr, vk};
+use ash::vk::Handle;
 use objc2::msg_send;
 use objc2::runtime::{AnyClass, AnyObject};
 
@@ -551,6 +552,18 @@ fn hook_table(name: &[u8]) -> vk::PFN_vkVoidFunction {
         b"vkGetRefreshCycleDurationGOOGLE" => get_refresh_cycle_duration as *const (),
         b"vkReleaseSwapchainImagesEXT" => release_swapchain_images as *const (),
         b"vkDestroySurfaceKHR" => destroy_surface as *const (),
+        // recon hooks exist only while LSFGM_RECON is set: the guard means the real
+        // driver function is handed out directly when recon is off, leaving the
+        // pass-through behavior identical to the identity build
+        b"vkCreateImage" if *RECON => create_image_recon as *const (),
+        b"vkCreateImageView" if *RECON => create_image_view_recon as *const (),
+        b"vkCreateFramebuffer" if *RECON => create_framebuffer_recon as *const (),
+        b"vkAllocateCommandBuffers" if *RECON => allocate_command_buffers_recon as *const (),
+        b"vkCmdBeginRenderPass" if *RECON => cmd_begin_render_pass_recon as *const (),
+        b"vkCmdBeginRenderPass2" if *RECON => cmd_begin_render_pass2_recon as *const (),
+        b"vkCmdBeginRenderPass2KHR" if *RECON => cmd_begin_render_pass2_khr_recon as *const (),
+        b"vkCmdBeginRendering" if *RECON => cmd_begin_rendering_recon as *const (),
+        b"vkCmdBeginRenderingKHR" if *RECON => cmd_begin_rendering_khr_recon as *const (),
         _ => return None,
     };
     void(f)
@@ -1332,6 +1345,10 @@ unsafe extern "system" fn queue_present(
     queue: vk::Queue,
     info: *const vk::PresentInfoKHR,
 ) -> vk::Result {
+    // recon: flush the per-frame render-target census (LSFGM_RECON only)
+    if *RECON {
+        recon_flush();
+    }
     let pi = &*info;
     if pi.swapchain_count == 0 || pi.p_swapchains.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -1674,10 +1691,344 @@ unsafe extern "system" fn destroy_surface(
     }
 }
 
+// ---- recon (LSFGM_RECON): image and render-target census ----
+//
+// Phase-0 probe for the frame-generation motion-vector question: log every image
+// (format, extent, usage) and, per presented frame, which images were drawn to and
+// how often. A velocity buffer shows up as an RG16F color attachment written every
+// frame; depth candidates as D32/D24 render targets. The hooks are handed out only
+// when LSFGM_RECON is set (guards in hook_table), so a normal launch is untouched.
+//
+// Limitations, accepted for a diagnostic session: no destroy tracking, so handle
+// reuse after vkDestroyImage can mislabel late entries; the census is meant to be
+// read over a single short session.
+
+static RECON: LazyLock<bool> = LazyLock::new(|| {
+    let on = std::env::var_os("LSFGM_RECON").is_some();
+    if on {
+        // warn level: prints regardless of the configured level, so an armed
+        // session is unmistakable in the log even if nothing else ever logs
+        warn!(
+            "RECON armed: LSFGM_RECON set, census hooks will be handed out (pid {})",
+            std::process::id()
+        );
+    }
+    on
+});
+static RECON_FIRST_HIT: AtomicBool = AtomicBool::new(false);
+static RECON_FRAMES: AtomicU64 = AtomicU64::new(0);
+// image -> (format, width, height, usage)
+static RECON_IMGS: LazyLock<Mutex<HashMap<u64, (vk::Format, u32, u32, vk::ImageUsageFlags)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// view -> image
+static RECON_VIEWS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// framebuffer -> attachment images
+static RECON_FBS: LazyLock<Mutex<HashMap<u64, Vec<u64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// command buffer -> device, so the command hooks can forward to the real functions
+static RECON_CBS: LazyLock<Mutex<HashMap<u64, vk::Device>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// render-target hits since the last present: image -> draw count
+static RECON_RTS: LazyLock<Mutex<HashMap<u64, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// a command hook only sees the command buffer; resolve its device, or any device
+// (single-device game) when the buffer somehow predates the registry
+fn recon_cb_device(cb: vk::CommandBuffer) -> Option<vk::Device> {
+    RECON_CBS
+        .lock()
+        .unwrap()
+        .get(&cb.as_raw())
+        .copied()
+        .or_else(|| MAPS.read().unwrap().devices.keys().next().copied())
+}
+
+fn recon_count_rt(img: u64) {
+    *RECON_RTS.lock().unwrap().entry(img).or_insert(0) += 1;
+}
+
+// present flush: one census line per frame; the per-frame regulars are the signal
+fn recon_flush() {
+    let n = RECON_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let mut rts: Vec<(u64, u32)> = RECON_RTS.lock().unwrap().drain().collect();
+    if n % 600 == 0 {
+        info!(
+            "RECON alive: present #{n} images={} views={} framebuffers={}",
+            RECON_IMGS.lock().unwrap().len(),
+            RECON_VIEWS.lock().unwrap().len(),
+            RECON_FBS.lock().unwrap().len()
+        );
+    }
+    if rts.is_empty() {
+        return;
+    }
+    rts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let imgs = RECON_IMGS.lock().unwrap();
+    let total: u32 = rts.iter().map(|(_, c)| c).sum();
+    let top: Vec<String> = rts
+        .iter()
+        .take(12)
+        .map(|(img, c)| match imgs.get(img) {
+            Some((fmt, w, h, _)) => format!("{img:#x}:{fmt:?}/{w}x{h}x{c}"),
+            None => format!("{img:#x}:unknown x{c}"),
+        })
+        .collect();
+    info!("RECON frame {n} draws={total} rts=[{}]", top.join(", "));
+}
+
+unsafe extern "system" fn create_image_recon(
+    device: vk::Device,
+    info: *const vk::ImageCreateInfo,
+    alloc: *const vk::AllocationCallbacks,
+    out: *mut vk::Image,
+) -> vk::Result {
+    let Some(real) = real_device_fn::<vk::PFN_vkCreateImage>(device, c"vkCreateImage") else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let r = real(device, info, alloc, out);
+    if !RECON_FIRST_HIT.swap(true, Ordering::Relaxed) {
+        warn!("RECON first vkCreateImage intercepted, census starts");
+    }
+    if r == vk::Result::SUCCESS && !info.is_null() && !out.is_null() {
+        let ci = &*info;
+        let e = &ci.extent;
+        RECON_IMGS
+            .lock()
+            .unwrap()
+            .insert((*out).as_raw(), (ci.format, e.width, e.height, ci.usage));
+        info!(
+            "RECON image {} fmt={:?} {}x{}x{} layers={} mips={} samples={:?} usage={:?}",
+            handle(*out),
+            ci.format,
+            e.width,
+            e.height,
+            e.depth,
+            ci.array_layers,
+            ci.mip_levels,
+            ci.samples,
+            ci.usage
+        );
+    }
+    r
+}
+
+unsafe extern "system" fn create_image_view_recon(
+    device: vk::Device,
+    info: *const vk::ImageViewCreateInfo,
+    alloc: *const vk::AllocationCallbacks,
+    out: *mut vk::ImageView,
+) -> vk::Result {
+    let Some(real) = real_device_fn::<vk::PFN_vkCreateImageView>(device, c"vkCreateImageView")
+    else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let r = real(device, info, alloc, out);
+    if r == vk::Result::SUCCESS && !info.is_null() && !out.is_null() {
+        let ci = &*info;
+        let sr = &ci.subresource_range;
+        RECON_VIEWS
+            .lock()
+            .unwrap()
+            .insert((*out).as_raw(), ci.image.as_raw());
+        info!(
+            "RECON view {} img={} fmt={:?} type={:?} aspect={:?} levels={} layers={}",
+            handle(*out),
+            handle(ci.image),
+            ci.format,
+            ci.view_type,
+            sr.aspect_mask,
+            sr.level_count,
+            sr.layer_count
+        );
+    }
+    r
+}
+
+unsafe extern "system" fn create_framebuffer_recon(
+    device: vk::Device,
+    info: *const vk::FramebufferCreateInfo,
+    alloc: *const vk::AllocationCallbacks,
+    out: *mut vk::Framebuffer,
+) -> vk::Result {
+    let Some(real) = real_device_fn::<vk::PFN_vkCreateFramebuffer>(device, c"vkCreateFramebuffer")
+    else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let r = real(device, info, alloc, out);
+    if r == vk::Result::SUCCESS && !info.is_null() && !out.is_null() {
+        let ci = &*info;
+        let views = RECON_VIEWS.lock().unwrap();
+        let imgs: Vec<u64> = if ci.p_attachments.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ci.p_attachments, ci.attachment_count as usize)
+                .iter()
+                .filter_map(|v| views.get(&v.as_raw()).copied())
+                .collect()
+        };
+        RECON_FBS.lock().unwrap().insert((*out).as_raw(), imgs);
+        info!(
+            "RECON framebuffer {} imgs={} {}x{} layers={}",
+            handle(*out),
+            ci.attachment_count,
+            ci.width,
+            ci.height,
+            ci.layers
+        );
+    }
+    r
+}
+
+unsafe extern "system" fn allocate_command_buffers_recon(
+    device: vk::Device,
+    info: *const vk::CommandBufferAllocateInfo,
+    out: *mut vk::CommandBuffer,
+) -> vk::Result {
+    let Some(real) =
+        real_device_fn::<vk::PFN_vkAllocateCommandBuffers>(device, c"vkAllocateCommandBuffers")
+    else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let r = real(device, info, out);
+    if r == vk::Result::SUCCESS && !info.is_null() && !out.is_null() {
+        let n = (*info).command_buffer_count as usize;
+        let mut cbs = RECON_CBS.lock().unwrap();
+        for i in 0..n {
+            cbs.insert(out.add(i).read().as_raw(), device);
+        }
+    }
+    r
+}
+
+unsafe fn recon_count_renderpass(info: *const vk::RenderPassBeginInfo) {
+    if info.is_null() {
+        return;
+    }
+    let fb = (*info).framebuffer;
+    if fb != vk::Framebuffer::null() {
+        let fbs = RECON_FBS.lock().unwrap();
+        if let Some(imgs) = fbs.get(&fb.as_raw()) {
+            for img in imgs {
+                recon_count_rt(*img);
+            }
+        }
+    }
+}
+
+unsafe fn recon_count_rendering(info: *const vk::RenderingInfo) {
+    if info.is_null() {
+        return;
+    }
+    let ri = &*info;
+    let views = RECON_VIEWS.lock().unwrap();
+    let count = |att: *const vk::RenderingAttachmentInfo| {
+        if !att.is_null() {
+            if let Some(img) = views.get(&(*att).image_view.as_raw()) {
+                recon_count_rt(*img);
+            }
+        }
+    };
+    if !ri.p_color_attachments.is_null() && ri.color_attachment_count > 0 {
+        for att in
+            std::slice::from_raw_parts(ri.p_color_attachments, ri.color_attachment_count as usize)
+        {
+            count(att);
+        }
+    }
+    count(ri.p_depth_attachment);
+    count(ri.p_stencil_attachment);
+}
+
+unsafe extern "system" fn cmd_begin_render_pass_recon(
+    cb: vk::CommandBuffer,
+    info: *const vk::RenderPassBeginInfo,
+    contents: vk::SubpassContents,
+) {
+    let Some(dev) = recon_cb_device(cb) else {
+        return;
+    };
+    let Some(real) = real_device_fn::<vk::PFN_vkCmdBeginRenderPass>(dev, c"vkCmdBeginRenderPass")
+    else {
+        return;
+    };
+    real(cb, info, contents);
+    recon_count_renderpass(info);
+}
+
+unsafe extern "system" fn cmd_begin_render_pass2_recon(
+    cb: vk::CommandBuffer,
+    info: *const vk::RenderPassBeginInfo,
+    sub: *const vk::SubpassBeginInfo,
+) {
+    let Some(dev) = recon_cb_device(cb) else {
+        return;
+    };
+    let Some(real) = real_device_fn::<vk::PFN_vkCmdBeginRenderPass2>(dev, c"vkCmdBeginRenderPass2")
+    else {
+        return;
+    };
+    real(cb, info, sub);
+    recon_count_renderpass(info);
+}
+
+unsafe extern "system" fn cmd_begin_render_pass2_khr_recon(
+    cb: vk::CommandBuffer,
+    info: *const vk::RenderPassBeginInfo,
+    sub: *const vk::SubpassBeginInfo,
+) {
+    let Some(dev) = recon_cb_device(cb) else {
+        return;
+    };
+    // the KHR alias has no separate ash PFN type; the core type shares the signature
+    let Some(real) =
+        real_device_fn::<vk::PFN_vkCmdBeginRenderPass2>(dev, c"vkCmdBeginRenderPass2KHR")
+    else {
+        return;
+    };
+    real(cb, info, sub);
+    recon_count_renderpass(info);
+}
+
+unsafe extern "system" fn cmd_begin_rendering_recon(
+    cb: vk::CommandBuffer,
+    info: *const vk::RenderingInfo,
+) {
+    let Some(dev) = recon_cb_device(cb) else {
+        return;
+    };
+    let Some(real) = real_device_fn::<vk::PFN_vkCmdBeginRendering>(dev, c"vkCmdBeginRendering")
+    else {
+        return;
+    };
+    real(cb, info);
+    recon_count_rendering(info);
+}
+
+unsafe extern "system" fn cmd_begin_rendering_khr_recon(
+    cb: vk::CommandBuffer,
+    info: *const vk::RenderingInfo,
+) {
+    let Some(dev) = recon_cb_device(cb) else {
+        return;
+    };
+    // the KHR alias has no separate ash PFN type; the core type shares the signature
+    let Some(real) =
+        real_device_fn::<vk::PFN_vkCmdBeginRendering>(dev, c"vkCmdBeginRenderingKHR")
+    else {
+        return;
+    };
+    real(cb, info);
+    recon_count_rendering(info);
+}
+
 // ---- static constructor ----
 
 extern "C" fn constructor() {
     panic_to_log();
+    // force recon initialization at load: the armed banner must print at process
+    // start whenever the env is set, not only at first use
+    let _ = *RECON;
     // the vulkan path initialises lazily inside the exports; the metal front end is armed at load
     let on = |k| settings::os_env(k).is_some_and(|v| !v.is_empty() && v != "0");
     if on("LSFGM_METAL") {

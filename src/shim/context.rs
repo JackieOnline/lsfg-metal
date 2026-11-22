@@ -39,6 +39,8 @@ impl Wrapper {
             profile.flow_scale,
             profile.performance_mode,
             hdr,
+            // the vk shim never sees 10-bit PQ layers; hdr here means scRGB
+            false,
         )?;
         let (source, dest, sync) = ctx.handles();
         let fence = vkutil::create_fence(&inst.device)?;

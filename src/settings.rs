@@ -77,6 +77,8 @@ pub struct Profile {
     pub performance_mode: bool,
     pub override_present_mode: bool,
     pub preserve_swapchain_image_count: bool,
+    // >0: paced native presents at this fps target, no generation
+    pub pacer_fps: u32,
 }
 
 impl Default for Profile {
@@ -90,6 +92,7 @@ impl Default for Profile {
             performance_mode: false,
             override_present_mode: true,
             preserve_swapchain_image_count: false,
+            pacer_fps: 0,
         }
     }
 }
@@ -200,6 +203,16 @@ fn env_profile(env: Env) -> Result<Profile, String> {
     }
     if let Some(v) = nonempty(env, "LSFGM_PRESERVE_SWAPCHAIN_IMAGE_COUNT") {
         p.preserve_swapchain_image_count = v == "1";
+    }
+    if let Some(v) = nonempty(env, "LSFGM_PACER") {
+        p.pacer_fps = v
+            .parse()
+            .ok()
+            .filter(|_| v.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or("Invalid LSFGM_PACER")?;
+        if !(10..=240).contains(&p.pacer_fps) {
+            return Err("LSFGM_PACER must be between 10 and 240 fps".into());
+        }
     }
     if p.multiplier > 4 {
         return Err("The macOS shim supports multipliers from 2 to 4".into());
@@ -711,6 +724,21 @@ mod tests {
         let p = &load_with(&e).unwrap().profiles[0];
         assert!(!p.performance_mode);
         assert_eq!(p.pacing_mode, PacingMode::Vsync);
+    }
+
+    #[test]
+    fn pacer_env() {
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_PACER", "30")]);
+        let p = &load_with(&e).unwrap().profiles[0];
+        assert_eq!(p.pacer_fps, 30);
+        // generation settings stand; the worker routes by pacer_fps, not multiplier
+        assert_eq!(p.multiplier, 2);
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_PACER", "0")]);
+        assert!(load_with(&e).is_err());
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_PACER", "300")]);
+        assert!(load_with(&e).is_err());
+        let e = env(&[("LSFGM_ENV", "1"), ("LSFGM_PACER", "30x")]);
+        assert!(load_with(&e).is_err());
     }
 
     #[test]

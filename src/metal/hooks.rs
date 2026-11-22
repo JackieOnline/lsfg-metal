@@ -63,6 +63,10 @@ pub(crate) fn mark_worker() {
     IS_WORKER.with(|w| w.set(true));
 }
 
+pub(crate) fn is_worker() -> bool {
+    IS_WORKER.with(|w| w.get())
+}
+
 
 // swizzle nextDrawable once; the command buffer hooks follow on first use
 pub fn install() {
@@ -246,14 +250,24 @@ unsafe extern "C-unwind" fn next_drawable_hook(
     sel: Sel,
 ) -> *mut AnyObject {
     let layer = &*this;
+    // recon: flush the per-frame render-target census (LSFGM_RECON only)
+    if super::recon::recon_on() {
+        super::recon::flush();
+    }
     INIT.call_once(|| {
-        if super::setup().is_some_and(|s| s.profile.multiplier > 1) {
+        if super::setup().is_some_and(|s| s.profile.multiplier > 1 || s.profile.pacer_fps > 0) {
             set_enabled(true);
             log::info("lsfg-metal metal front end active");
         }
     });
     if enabled() && !is_vulkan_layer(layer) && layer_supported(layer) {
         install_cb_hooks(layer);
+        // recon: arm once per process, but only for game-sized layers; the
+        // constructor-time install wedged the wine boot chain (recon3 session)
+        if super::recon::recon_on() {
+            let size = layer.drawableSize();
+            super::recon::install_deferred(size.width >= 1500.0);
+        }
         if layer.maximumDrawableCount() < 3 {
             layer.setMaximumDrawableCount(3);
         }

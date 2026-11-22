@@ -4,7 +4,10 @@ mod generator;
 mod gl;
 mod hooks;
 mod latency;
+mod probe;
 mod proxy;
+mod recon;
+mod memscan;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +24,9 @@ pub use hooks::{forget_surface, register_layer};
 pub fn install() {
     hooks::install();
     gl::install();
+    // recon installs deferred from the first game-sized layer (hooks.rs), never
+    // at constructor time: eager process-wide Metal device creation wedged the
+    // wine boot chain (FeverGamesWeb never came up, recon3 session)
 }
 
 // only the opengl buffer swap, for processes whose metal layers belong to a vulkan driver

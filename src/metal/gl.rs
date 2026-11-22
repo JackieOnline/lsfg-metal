@@ -427,7 +427,7 @@ impl Context {
             for _ in 0..=m {
                 c.cmd.push(vkutil::allocate_command_buffer(d, b.pool)?);
             }
-            c.wrapper = Some(Wrapper::new(b, extent, flow, perf, false)?);
+            c.wrapper = Some(Wrapper::new(b, extent, flow, perf, false, false)?);
             Ok::<_, String>(())
         })();
         match built {
