@@ -100,6 +100,10 @@ impl Generator {
         // sinks it to ~20 fps, below the gate rate. Depth 2 keeps one frame of
         // overlap while still barring the 2-3 deep queue that makes an unpaced
         // producer run ahead of the display.
+        // generation: LSFGM_POOL (1..=3, default 3 as shipped). Experiment in
+        // flight: depth 2 with an unlimited in-game cap - one frame of overlap
+        // for the interpolation pipeline, while the queue that makes unpaced
+        // generation feel mushy shrinks by a frame.
         let pool_cap = if super::setup().is_some_and(|s| s.profile.pacer_fps > 0) {
             std::env::var("LSFGM_PACER_POOL")
                 .ok()
@@ -107,7 +111,11 @@ impl Generator {
                 .filter(|n| (1..=3).contains(n))
                 .unwrap_or(2)
         } else {
-            3
+            std::env::var("LSFGM_POOL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| (1..=3).contains(n))
+                .unwrap_or(3)
         };
         let g = Box::leak(Box::new(Generator {
             latency: latency::Probe::default(),
@@ -936,8 +944,9 @@ impl Worker {
             format!("multiplier {m}")
         };
         log::info(&format!(
-            "Metal presentation {w}x{h} ({format:?}), {mode}, display {} Hz",
-            (1.0 / self.refresh).round()
+            "Metal presentation {w}x{h} ({format:?}), {mode}, display {} Hz, proxy pool depth {}",
+            (1.0 / self.refresh).round(),
+            self.gen.pool_cap
         ));
         let b = self.backend.as_ref().ok_or("backend missing")?;
         self.ctx = Some(Wrapper::new(
