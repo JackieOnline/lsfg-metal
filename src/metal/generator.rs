@@ -554,8 +554,9 @@ impl Wrapper {
         perf: bool,
         hdr: bool,
         pq: bool,
+        deadband: bool,
     ) -> Result<Wrapper, String> {
-        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr, pq)?;
+        let ctx = Context::new(b.inst.clone(), w, h, flow, perf, hdr, pq, deadband)?;
         let (source, dest, sync) = ctx.handles();
         Ok(Wrapper {
             ctx,
@@ -635,6 +636,11 @@ impl Wrapper {
                 &[],
                 &post,
             );
+            // optional HDR temporal deadband, in the same import command buffer.
+            // the first frame has no previous layer to compare against.
+            if self.iteration != 0 {
+                self.ctx.apply_deadband(cb, layer);
+            }
             check(d.end_command_buffer(cb), "vkEndCommandBuffer")?;
         }
         b.submit(
@@ -963,6 +969,8 @@ impl Worker {
             // the metal route handles 10-bit PQ through the 16F pipeline itself;
             // the front-end PQ day-convert belongs to the dormant GL path
             false,
+            // only 10-bit PQ layers get the temporal deadband; scRGB 16F does not
+            format == vk::Format::A2B10G10R10_UNORM_PACK32,
         )?);
         self.pacer = adaptive.then(|| Pacer::new(self.refresh, m));
         if self.sems.is_none() {

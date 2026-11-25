@@ -41,6 +41,8 @@ impl Wrapper {
             hdr,
             // the vk shim never sees 10-bit PQ layers; hdr here means scRGB
             false,
+            // the deadband pass targets 10-bit PQ codes; not used on this path
+            false,
         )?;
         let (source, dest, sync) = ctx.handles();
         let fence = vkutil::create_fence(&inst.device)?;

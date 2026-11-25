@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
 
     let t0 = Instant::now();
     let inst = Arc::new(Instance::own(&driver, "", &dll, fp16, false, relog)?);
-    let mut ctx = Context::new(inst.clone(), w, h, flow, perf, hdr, false)?;
+    let mut ctx = Context::new(inst.clone(), w, h, flow, perf, hdr, false, false)?;
     let build = t0.elapsed();
     if partial {
         // regression: a partial iteration never submits the completion fence; the next dispatch and the drop must still return

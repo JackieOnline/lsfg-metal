@@ -202,8 +202,17 @@ pub struct Context {
     sync_value: u64,
     internal_value: u64,
     fence_pending: bool,
+    // dropped before pipeline: its views point into pipeline.source
+    deadband: Option<deadband::Deadband>,
     pub pipeline: Pipeline,
     convert: Option<convert::Convert>,
+}
+
+// opt-in experiment: LSFGM_DEADBAND=1 (or any non-zero value)
+fn deadband_enabled() -> bool {
+    std::env::var("LSFGM_DEADBAND")
+        .map(|v| v != "0")
+        .unwrap_or(false)
 }
 
 impl Context {
@@ -215,6 +224,7 @@ impl Context {
         perf: bool,
         hdr: bool,
         pq: bool,
+        deadband: bool,
     ) -> Result<Context, String> {
         let pipeline = Pipeline::new(inst.clone(), w, h, flow, perf, hdr)?;
         // PQ day route: convert codes to sRGB at the boundaries so the
@@ -226,6 +236,22 @@ impl Context {
                 pipeline.destination,
                 (w, h),
             )?)
+        } else {
+            None
+        };
+        // 10-bit PQ layers dither every frame; the flow matcher reads that
+        // noise as motion and warps static lines. This is an opt-in A/B pass.
+        let deadband = if deadband && hdr && deadband_enabled() {
+            match deadband::Deadband::new(inst.clone(), pipeline.source, (w, h)) {
+                Ok(db) => {
+                    crate::log::info("HDR deadband pass enabled (4/1023 threshold)");
+                    Some(db)
+                }
+                Err(e) => {
+                    crate::log::warn(&format!("HDR deadband disabled: {e}"));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -247,6 +273,7 @@ impl Context {
             sync_value: 0,
             internal_value: 0,
             fence_pending: false,
+            deadband,
             pipeline,
             convert,
         })
@@ -255,6 +282,74 @@ impl Context {
     // (source image with 2 layers, destination image, sync semaphore)
     pub fn handles(&self) -> (vk::Image, vk::Image, vk::Semaphore) {
         (self.pipeline.source, self.pipeline.destination, self.sync)
+    }
+
+    // temporal deadband on the freshly imported source layer, before the flow pass.
+    // the caller records this into the import command buffer; returns false when off.
+    pub fn apply_deadband(&self, cb: vk::CommandBuffer, layer: u32) -> bool {
+        let Some(db) = self.deadband.as_ref() else {
+            return false;
+        };
+        let dev = &self.inst.device;
+        let cur = layer % 2;
+        let prev = (layer + 1) % 2;
+        use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
+        unsafe {
+            // the import blit wrote cur; prev is the previous iteration's frame
+            dev.cmd_pipeline_barrier(
+                cb,
+                P::TRANSFER,
+                P::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vkutil::image_barrier(
+                    A::TRANSFER_WRITE,
+                    A::SHADER_READ | A::SHADER_WRITE,
+                    L::GENERAL,
+                    L::GENERAL,
+                    self.pipeline.source,
+                    cur,
+                    1,
+                )],
+            );
+            dev.cmd_pipeline_barrier(
+                cb,
+                P::TOP_OF_PIPE,
+                P::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vkutil::image_barrier(
+                    A::NONE,
+                    A::SHADER_READ,
+                    L::GENERAL,
+                    L::GENERAL,
+                    self.pipeline.source,
+                    prev,
+                    1,
+                )],
+            );
+            db.apply(cb, cur);
+            dev.cmd_pipeline_barrier(
+                cb,
+                P::COMPUTE_SHADER,
+                P::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vkutil::image_barrier(
+                    A::SHADER_WRITE,
+                    A::SHADER_READ,
+                    L::GENERAL,
+                    L::GENERAL,
+                    self.pipeline.source,
+                    cur,
+                    1,
+                )],
+            );
+        }
+        true
     }
 
     // PQ boundary conversion when the layer carries 10-bit HDR10 codes
